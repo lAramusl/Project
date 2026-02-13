@@ -524,7 +524,37 @@ void recv_and_verify_key(int sock,
     EVP_MD_CTX_free(mdctx);
 }
 
+EVP_PKEY* generate_x25519_key(void)
+{
+    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+    if (!pctx) handle_errors();
 
+    if (EVP_PKEY_keygen_init(pctx) <= 0)
+        handle_errors();
+
+    EVP_PKEY *pkey = NULL;
+
+    if (EVP_PKEY_keygen(pctx, &pkey) <= 0)
+        handle_errors();
+
+    EVP_PKEY_CTX_free(pctx);
+    return pkey;
+}
+
+
+void write_private_key(const char *filename, EVP_PKEY *pkey)
+{
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) {
+        perror("fopen");
+        exit(EXIT_FAILURE);
+    }
+
+    if (!PEM_write_PrivateKey(fp, pkey, NULL, NULL, 0, NULL, NULL))
+        handle_errors();
+
+    fclose(fp);
+}
 
 int main(void)
 {
