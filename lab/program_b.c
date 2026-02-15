@@ -472,48 +472,63 @@ int recv_secure_message(int sock,
 
 void send_signed_key(int sock,
                      EVP_PKEY *sign_key,
+                     EVP_PKEY *sign_pubkey,
                      const unsigned char *ecdh_pub,
-                     size_t ecdh_pub_len)
+                     size_t ecdh_pub_len,
+                     unsigned char *signature_out)
 {
-    unsigned char signature[SIG_LEN];
+    unsigned char sign_pub[ED25519_PUBKEY_LEN];
+    size_t sign_pub_len = ED25519_PUBKEY_LEN;
+
+    if (EVP_PKEY_get_raw_public_key(sign_pubkey,
+                                    sign_pub,
+                                    &sign_pub_len) <= 0)
+        handle_errors();
+
     size_t sig_len = SIG_LEN;
 
     EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
     if (!mdctx) handle_errors();
 
-    if (EVP_DigestSignInit(mdctx, NULL, NULL, NULL, sign_key) <= 0)
-        handle_errors();
+    EVP_DigestSignInit(mdctx, NULL, NULL, NULL, sign_key);
 
-    if (EVP_DigestSign(mdctx,
-                       signature,
-                       &sig_len,
-                       ecdh_pub,
-                       ecdh_pub_len) <= 0)
-        handle_errors();
+    EVP_DigestSign(mdctx,
+                   signature_out,
+                   &sig_len,
+                   ecdh_pub,
+                   ecdh_pub_len);
 
     EVP_MD_CTX_free(mdctx);
 
     send(sock, ecdh_pub, ecdh_pub_len, 0);
-    send(sock, signature, SIG_LEN, 0);
+    send(sock, sign_pub, ED25519_PUBKEY_LEN, 0);
+    send(sock, signature_out, SIG_LEN, 0);
 }
 
 void recv_and_verify_key(int sock,
-                         EVP_PKEY *peer_sign_pubkey,
-                         unsigned char *peer_ecdh_pub)
+                         unsigned char *peer_ecdh_pub,
+                         unsigned char *peer_sign_pub,
+                         unsigned char *peer_sig_out)
 {
-    unsigned char peer_sig[SIG_LEN];
-
     recv(sock, peer_ecdh_pub, PUBKEY_LEN, MSG_WAITALL);
-    recv(sock, peer_sig, SIG_LEN, MSG_WAITALL);
+    recv(sock, peer_sign_pub, ED25519_PUBKEY_LEN, MSG_WAITALL);
+    recv(sock, peer_sig_out, SIG_LEN, MSG_WAITALL);
 
-    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-    if (!mdctx) handle_errors();
+    EVP_PKEY *peer_sign_pubkey =
+        EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519,
+                                    NULL,
+                                    peer_sign_pub,
+                                    ED25519_PUBKEY_LEN);
 
-    if (EVP_DigestVerifyInit(mdctx, NULL, NULL, NULL, peer_sign_pubkey) <= 0)
+    if (!peer_sign_pubkey)
         handle_errors();
 
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+
+    EVP_DigestVerifyInit(mdctx, NULL, NULL, NULL, peer_sign_pubkey);
+
     if (EVP_DigestVerify(mdctx,
-                         peer_sig,
+                         peer_sig_out,
                          SIG_LEN,
                          peer_ecdh_pub,
                          PUBKEY_LEN) <= 0) {
@@ -522,6 +537,7 @@ void recv_and_verify_key(int sock,
     }
 
     EVP_MD_CTX_free(mdctx);
+    EVP_PKEY_free(peer_sign_pubkey);
 }
 
 EVP_PKEY* generate_x25519_key(void)
@@ -561,128 +577,163 @@ int main(void)
     ERR_load_crypto_strings();
     OpenSSL_add_all_algorithms();
 
-    EVP_PKEY *my_sign_key = load_private_key("ed25519_key.pem");
-    EVP_PKEY *peer_sign_pubkey = load_public_key("peer_ed25519_pub.pem");
-
-    if (!my_sign_key || !peer_sign_pubkey) {
-        fprintf(stderr, "Signing keys missing\n");
+    // --- Load ONLY private signing key ---
+    EVP_PKEY *my_sign_key = load_private_key("ed25519_key_B.pem");
+    if (!my_sign_key) {
+        fprintf(stderr, "Signing key missing\n");
         exit(EXIT_FAILURE);
     }
 
-    // 1. Load private key (X25519 expected)
-    EVP_PKEY *privkey = load_private_key("x25519_key.pem");
+    // --- Extract own Ed25519 public key ---
+    EVP_PKEY *my_sign_pubkey = extract_ed25519_public(my_sign_key);
 
-    if (!privkey) {
-        printf("Generating new X25519 key...\n");
-        privkey = generate_x25519_key();
-        write_private_key("x25519_key.pem", privkey);
+    // --- Generate ephemeral X25519 ---
+    EVP_PKEY *my_x25519 = generate_x25519_key();
+
+    unsigned char my_pub[PUBKEY_LEN];
+    size_t my_pub_len = PUBKEY_LEN;
+    extract_public_key(my_x25519, my_pub, &my_pub_len);
+
+    // =============================
+    // SERVER SOCKET
+    // =============================
+
+    int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_sock < 0) { perror("socket"); exit(EXIT_FAILURE); }
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(listen_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind"); exit(EXIT_FAILURE);
     }
 
+    if (listen(listen_sock, 1) < 0) {
+        perror("listen"); exit(EXIT_FAILURE);
+    }
 
-    // 2. Extract public key
-    unsigned char public_key[PUBKEY_LEN];
-    size_t public_key_len = PUBKEY_LEN;
-    extract_public_key(privkey, public_key, &public_key_len);
-
-    // 3. Create socket (client mode)
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    int sock = accept(listen_sock, NULL, NULL);
     if (sock < 0) {
-        perror("socket");
-        exit(EXIT_FAILURE);
+        perror("accept"); exit(EXIT_FAILURE);
     }
 
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
-    inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr);
+    close(listen_sock);
 
-    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("connect");
-        exit(EXIT_FAILURE);
-    }
+    // =============================
+    // HANDSHAKE
+    // =============================
 
-    // 4. send our key + signature
-    send_signed_key(sock,
-                    my_sign_key,
-                    public_key,
-                    public_key_len);
-
-    // 5. receive peer key + verify
-    unsigned char peer_pubkey[PUBKEY_LEN];
-
-    recv_and_verify_key(sock,
-                        peer_sign_pubkey,
-                        peer_pubkey);
-
-    EVP_PKEY *peerkey =
-    EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519,
-                                NULL,
-                                peer_pubkey,
-                                PUBKEY_LEN);
-
-    // 6. Derive shared secret
-    unsigned char shared_secret[SHARED_SECRET_LEN];
-    size_t shared_secret_len = SHARED_SECRET_LEN;
-
-    derive_shared_secret(privkey, peerkey,
-                         shared_secret, &shared_secret_len);
-
-    unsigned char aes_key[AES_KEY_LEN];
-    derive_aes_key(shared_secret, shared_secret_len, aes_key);
-
-    printf("Shared secret (%zu bytes):\n", shared_secret_len);
-    for (size_t i = 0; i < shared_secret_len; i++)
-        printf("%02x", shared_secret[i]);
-    printf("\n");
-
-    uint32_t send_seq = 0;
-    uint32_t recv_seq = 0;
-    
     transcript_t transcript;
     transcript_init(&transcript);
 
-    // --- Handshake transcript update (ECDH keys) ---
-    transcript_update(&transcript, public_key, PUBKEY_LEN);
-    transcript_update(&transcript, peer_pubkey, PUBKEY_LEN);
+    unsigned char my_sig[SIG_LEN];
+    unsigned char peer_pub[PUBKEY_LEN];
+    unsigned char peer_sign_pub[ED25519_PUBKEY_LEN];
+    unsigned char peer_sig[SIG_LEN];
 
-    // --- Compute handshake hash ---
+    // --- B receives first ---
+    recv_and_verify_key(sock,
+                        peer_pub,
+                        peer_sign_pub,
+                        peer_sig);
+
+    transcript_update(&transcript, peer_pub, PUBKEY_LEN);
+    transcript_update(&transcript, peer_sign_pub, ED25519_PUBKEY_LEN);
+    transcript_update(&transcript, peer_sig, SIG_LEN);
+
+    // --- B sends ---
+    send_signed_key(sock,
+                    my_sign_key,
+                    my_sign_pubkey,
+                    my_pub,
+                    PUBKEY_LEN,
+                    my_sig);
+
+    unsigned char my_sign_pub_raw[ED25519_PUBKEY_LEN];
+    size_t tmp_len = ED25519_PUBKEY_LEN;
+    EVP_PKEY_get_raw_public_key(my_sign_pubkey,
+                                my_sign_pub_raw,
+                                &tmp_len);
+
+    transcript_update(&transcript, my_pub, PUBKEY_LEN);
+    transcript_update(&transcript, my_sign_pub_raw, ED25519_PUBKEY_LEN);
+    transcript_update(&transcript, my_sig, SIG_LEN);
+
+    // --- Build peer X25519 ---
+    EVP_PKEY *peer_x25519 =
+        EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519,
+                                    NULL,
+                                    peer_pub,
+                                    PUBKEY_LEN);
+
+    // --- Derive shared secret ---
+    unsigned char shared_secret[SHARED_SECRET_LEN];
+    size_t ss_len = SHARED_SECRET_LEN;
+
+    derive_shared_secret(my_x25519,
+                         peer_x25519,
+                         shared_secret,
+                         &ss_len);
+
+    unsigned char aes_key[AES_KEY_LEN];
+    derive_aes_key(shared_secret, ss_len, aes_key);
+
+    // --- Transcript hash ---
     unsigned char handshake_hash[TRANSCRIPT_HASH_LEN];
     transcript_final(&transcript, handshake_hash);
 
-    // --- Finished message (send hash securely) ---
-    send_secure_message(sock,
-                        &send_seq,
-                        NULL,              // transcript not used post-handshake
-                        handshake_hash,
-                        TRANSCRIPT_HASH_LEN,
-                        aes_key);
+    uint32_t send_seq = 0;
+    uint32_t recv_seq = 0;
 
-    // --- Receive peer Finished ---
+    // --- B receives Finished first ---
     unsigned char peer_finished[TRANSCRIPT_HASH_LEN];
 
-    int finished_len = recv_secure_message(sock,
-                                        &recv_seq,
-                                        NULL,
-                                        peer_finished,
-                                        aes_key);
+    int flen = recv_secure_message(sock,
+                                   &recv_seq,
+                                   NULL,
+                                   peer_finished,
+                                   aes_key);
 
-    if (finished_len != TRANSCRIPT_HASH_LEN ||
-        memcmp(handshake_hash, peer_finished, TRANSCRIPT_HASH_LEN) != 0) {
+    if (flen != TRANSCRIPT_HASH_LEN ||
+        memcmp(handshake_hash,
+               peer_finished,
+               TRANSCRIPT_HASH_LEN) != 0) {
         fprintf(stderr, "Finished verification failed\n");
         exit(EXIT_FAILURE);
     }
 
-    printf("Handshake fully verified\n");
+    // --- B sends Finished ---
+    send_secure_message(sock,
+                        &send_seq,
+                        NULL,
+                        handshake_hash,
+                        TRANSCRIPT_HASH_LEN,
+                        aes_key);
 
-    // =====================
-    // SECURE CHAT LOOP
-    // =====================
+    printf("Handshake verified\n");
+
+    // =============================
+    // SECURE CHAT
+    // =============================
 
     while (1)
     {
         char input[MAX_PAYLOAD];
         unsigned char decrypted[MAX_PAYLOAD];
+
+        int rlen = recv_secure_message(sock,
+                                       &recv_seq,
+                                       NULL,
+                                       decrypted,
+                                       aes_key);
+
+        if (rlen <= 0)
+            break;
+
+        decrypted[rlen] = 0;
+        printf("Peer: %s", decrypted);
 
         printf("You: ");
         fflush(stdout);
@@ -690,34 +741,20 @@ int main(void)
         if (!fgets(input, sizeof(input), stdin))
             break;
 
-        int input_len = strlen(input);
-
-        int received_len = recv_secure_message(sock,
-                                            &recv_seq,
-                                            NULL,
-                                            decrypted,
-                                            aes_key);
-
-        if (received_len <= 0) {
-            printf("Connection closed or error\n");
-            break;
-        }
-
-        decrypted[received_len] = '\0';
-        printf("Peer: %s", decrypted);
+        int len = strlen(input);
 
         send_secure_message(sock,
                             &send_seq,
                             NULL,
                             (unsigned char*)input,
-                            input_len,
+                            len,
                             aes_key);
     }
 
     EVP_PKEY_free(my_sign_key);
-    EVP_PKEY_free(peer_sign_pubkey);
-    EVP_PKEY_free(peerkey);
-    EVP_PKEY_free(privkey);
+    EVP_PKEY_free(my_sign_pubkey);
+    EVP_PKEY_free(my_x25519);
+    EVP_PKEY_free(peer_x25519);
 
     close(sock);
 
@@ -725,5 +762,6 @@ int main(void)
     ERR_free_strings();
 
     return 0;
-
 }
+
+
