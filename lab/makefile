@@ -9,6 +9,8 @@ LIBS += $(shell pkg-config --libs openssl)
 # Alternative for specific libraries if 'openssl' meta-package is not available:
 # LIBS += $(shell pkg-config --libs libcrypto libssl)
 # Example target
+all: keygenerator program_a program_b
+
 keygenerator: keygenerator.o
 	$(CC) -o $@ $^ $(LDFLAGS) $(LIBS)
 

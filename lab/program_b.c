@@ -1,5 +1,5 @@
-// program_a.c
-// gcc program_a.c -o program_a -lssl -lcrypto
+// program_b.c
+// gcc program_b.c -o program_b -lssl -lcrypto
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,7 +49,6 @@ EVP_PKEY* load_private_key(const char *filename)
 
     return pkey;
 }
-
 
 void extract_public_key(EVP_PKEY *pkey, unsigned char *pubkey, size_t *len)
 {
@@ -144,22 +143,24 @@ void authenticate_peer(int sock,
     printf("Authentication successful\n");
 }
 
-
-EVP_PKEY* load_public_key(const char *filename)
+EVP_PKEY* extract_ed25519_public(EVP_PKEY *privkey)
 {
-    FILE *fp = fopen(filename, "rb");
-    if (!fp) {
-        perror("fopen");
-        exit(EXIT_FAILURE);
-    }
+    unsigned char pub[ED25519_PUBKEY_LEN];
+    size_t len = ED25519_PUBKEY_LEN;
 
-    EVP_PKEY *pkey = PEM_read_PUBKEY(fp, NULL, NULL, NULL);
-    fclose(fp);
-
-    if (!pkey)
+    if (EVP_PKEY_get_raw_public_key(privkey, pub, &len) <= 0)
         handle_errors();
 
-    return pkey;
+    EVP_PKEY *pubkey =
+        EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519,
+                                    NULL,
+                                    pub,
+                                    len);
+
+    if (!pubkey)
+        handle_errors();
+
+    return pubkey;
 }
 
 // ===== HKDF + AES-256-GCM =====
