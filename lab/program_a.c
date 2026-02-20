@@ -51,6 +51,30 @@ EVP_PKEY* load_private_key(const char *filename)
     return pkey;
 }
 
+void make_nonce(unsigned char *nonce,
+                const unsigned char *static_iv,
+                uint64_t seq)
+{
+    memcpy(nonce, static_iv, AES_IV_LEN);
+
+    uint64_t seq_be = htobe64(seq);
+
+    for (int i = 0; i < 8; i++) {
+        nonce[4 + i] ^= ((unsigned char*)&seq_be)[i];
+    }
+}
+
+void compute_finished(const unsigned char *finished_key,
+                      const unsigned char *transcript_hash,
+                      unsigned char *out)
+{
+    unsigned int len;
+    HMAC(EVP_sha256(),
+         finished_key, 32,
+         transcript_hash, 32,
+         out, &len);
+}
+
 void derive_shared_secret(EVP_PKEY *privkey,
                           EVP_PKEY *peerkey,
                           unsigned char *secret,
@@ -247,7 +271,7 @@ void secure_send(int sock, const unsigned char *data, size_t len,
     unsigned char tag[AES_TAG_LEN];
     
     // Generate random IV
-    RAND_bytes(iv, AES_IV_LEN);
+    make_nonce(iv, client_iv, *seq);
     
     // Encrypt with sequence number as AAD
     int cipher_len = aes_gcm_encrypt(data, len, (unsigned char*)seq, 4, 
@@ -268,6 +292,8 @@ void secure_receive(int sock, unsigned char *data, size_t expected_len,
     unsigned char ciphertext[MAX_PAYLOAD];
     unsigned char tag[AES_TAG_LEN];
     
+    make_nonce(iv, server_iv, *seq);
+
     recv(sock, iv, AES_IV_LEN, 0);
     recv(sock, ciphertext, expected_len, 0);  
     recv(sock, tag, AES_TAG_LEN, 0);
@@ -281,6 +307,23 @@ void secure_receive(int sock, unsigned char *data, size_t expected_len,
     (*seq)++;
 }
 //Just one function to send and one function to recieve
+void hkdf_expand(const unsigned char *secret,
+                 size_t secret_len,
+                 const char *label,
+                 unsigned char *out,
+                 size_t out_len)
+{
+    EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
+    EVP_PKEY_derive_init(kctx);
+    EVP_PKEY_CTX_set_hkdf_md(kctx, EVP_sha256());
+    EVP_PKEY_CTX_set1_hkdf_key(kctx, secret, secret_len);
+    EVP_PKEY_CTX_add1_hkdf_info(kctx,
+                                (unsigned char*)label,
+                                strlen(label));
+    EVP_PKEY_derive(kctx, out, &out_len);
+    EVP_PKEY_CTX_free(kctx);
+}
+
 EVP_PKEY* generate_x25519_key(void)
 {
     EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
@@ -298,6 +341,23 @@ EVP_PKEY* generate_x25519_key(void)
     return pkey;
 }
 
+EVP_MD_CTX *transcript_ctx;
+
+void transcript_init()
+{
+    transcript_ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(transcript_ctx, EVP_sha256(), NULL);
+}
+
+void transcript_update(const void *data, size_t len)
+{
+    EVP_DigestUpdate(transcript_ctx, data, len);
+}
+
+void transcript_final(unsigned char *out)
+{
+    EVP_DigestFinal_ex(transcript_ctx, out, NULL);
+}
 
 int main(void)
 {
@@ -320,6 +380,23 @@ int main(void)
         perror("connect"); exit(EXIT_FAILURE);
     }
 
+    transcript_init();
+
+    handshake_hello_t ch;
+    ch.version = htons(0x0304);
+    ch.cipher_suite = htons(0x1301);
+
+    send(sock, &ch, sizeof(ch), 0);
+    transcript_update(&ch, sizeof(ch));
+
+    handshake_hello_t sh;
+    recv(sock, &sh, sizeof(sh), 0);
+    transcript_update(&sh, sizeof(sh));
+    if (ntohs(sh.version) != 0x0304)
+    {
+        printf("Version mismatch\n");
+        exit(EXIT_FAILURE);
+    }
     // --- Load ONLY private signing key ---
     EVP_PKEY *my_sign_key = load_private_key("ed25519_key_A.pem");
     if (!my_sign_key) {
@@ -358,9 +435,17 @@ int main(void)
     
     if (EVP_DigestSignInit(mdctx, NULL, NULL, NULL, my_sign_key) <= 0)
         handle_errors();
-    if (EVP_DigestSign(mdctx, signature, &sig_len, my_pub, PUBKEY_LEN) <= 0)
-        handle_errors();
-    EVP_MD_CTX_free(mdctx);
+    unsigned char temp_hash[32];
+    EVP_MD_CTX *tmp = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(tmp, EVP_sha256(), NULL);
+    EVP_DigestUpdate(tmp, my_pub, PUBKEY_LEN);
+    EVP_DigestFinal_ex(tmp, temp_hash, NULL);
+    EVP_MD_CTX_free(tmp);
+
+    EVP_DigestSign(mdctx, signature, &sig_len, temp_hash, 32);
+    transcript_update(my_pub, PUBKEY_LEN);
+    transcript_update(my_sign_pub, ED25519_PUBKEY_LEN);
+    transcript_update(signature, SIG_LEN);
 
     send(sock, signature, SIG_LEN, 0);
 
@@ -372,6 +457,10 @@ int main(void)
     recv(sock, server_pub, PUBKEY_LEN, 0);
     recv(sock, server_sign_pub, ED25519_PUBKEY_LEN, 0);
     recv(sock, server_sig, SIG_LEN, 0);
+
+    transcript_update(server_pub, PUBKEY_LEN);
+    transcript_update(server_sign_pub, ED25519_PUBKEY_LEN);
+    transcript_update(server_sig, SIG_LEN);
 
     // --- Build server Ed25519 public key for signature verification ---
     EVP_PKEY *server_sign_key = 
@@ -402,7 +491,38 @@ int main(void)
 
     // --- Derive AES key for secure chat ---
     unsigned char aes_key[AES_KEY_LEN];
-    derive_aes_key(shared_secret, ss_len, aes_key);
+    unsigned char client_key[32];
+    unsigned char server_key[32];
+    unsigned char client_iv[12];
+    unsigned char server_iv[12];
+    unsigned char client_finished_key[32];
+    unsigned char server_finished_key[32];
+
+    hkdf_expand(shared_secret, ss_len, "client key", client_key, 32);
+    hkdf_expand(shared_secret, ss_len, "server key", server_key, 32);
+    hkdf_expand(shared_secret, ss_len, "client iv", client_iv, 12);
+    hkdf_expand(shared_secret, ss_len, "server iv", server_iv, 12);
+    hkdf_expand(shared_secret, ss_len, "client finished", client_finished_key, 32);
+    hkdf_expand(shared_secret, ss_len, "server finished", server_finished_key, 32);
+
+    unsigned char transcript_hash[32];
+    transcript_final(transcript_hash);
+
+    unsigned char my_finished[32];
+    compute_finished(client_finished_key, transcript_hash, my_finished);
+
+    send(sock, my_finished, 32, 0);
+
+    unsigned char server_finished[32];
+    recv(sock, server_finished, 32, 0);
+
+    unsigned char expected[32];
+    compute_finished(server_finished_key, transcript_hash, expected);
+
+    if (memcmp(expected, server_finished, 32) != 0) {
+        printf("Finished verify failed\n");
+        exit(EXIT_FAILURE);
+    }
 
     printf("[Handshake] Finished: AES key established\n");
    
@@ -425,5 +545,4 @@ int main(void)
 
     return 0;
 }
-
 
