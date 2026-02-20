@@ -16,6 +16,7 @@
 #include <openssl/kdf.h>
 #include <openssl/rand.h>
 
+
 #define PORT 4444
 #define PUBKEY_LEN 32
 #define SHARED_SECRET_LEN 32
@@ -230,8 +231,56 @@ int aes_gcm_decrypt(const unsigned char *ciphertext, int ciphertext_len,
 
 // ================= SECURE SEND WITH SEQ + TRANSCRIPT =================
 
-//Just one function to send and one function to recieve
 
+//Just one function to send and one function to recieve
+// 1. VERSION & CIPHER NEGOTIATION (add before key exchange)
+typedef struct {
+    uint16_t version;        // e.g., 0x0304 for TLS 1.3
+    uint16_t cipher_suite;   // e.g., 0x1301 for AES_256_GCM_SHA384
+} handshake_hello_t;
+
+// 2. SECURE SEND FUNCTION
+void secure_send(int sock, const unsigned char *data, size_t len, 
+                 const unsigned char *key, uint32_t *seq) {
+    unsigned char iv[AES_IV_LEN];
+    unsigned char ciphertext[MAX_PAYLOAD];
+    unsigned char tag[AES_TAG_LEN];
+    
+    // Generate random IV
+    RAND_bytes(iv, AES_IV_LEN);
+    
+    // Encrypt with sequence number as AAD
+    int cipher_len = aes_gcm_encrypt(data, len, (unsigned char*)seq, 4, 
+                                     key, iv, ciphertext, tag);
+    
+    // Send: IV + ciphertext + tag
+    send(sock, iv, AES_IV_LEN, 0);
+    send(sock, ciphertext, cipher_len, 0);
+    send(sock, tag, AES_TAG_LEN, 0);
+    
+    (*seq)++;
+}
+
+// 3. SECURE RECEIVE FUNCTION  
+void secure_receive(int sock, unsigned char *data, size_t expected_len,
+                    const unsigned char *key, uint32_t *seq) {
+    unsigned char iv[AES_IV_LEN];
+    unsigned char ciphertext[MAX_PAYLOAD];
+    unsigned char tag[AES_TAG_LEN];
+    
+    recv(sock, iv, AES_IV_LEN, 0);
+    recv(sock, ciphertext, expected_len, 0);  
+    recv(sock, tag, AES_TAG_LEN, 0);
+    
+    if (aes_gcm_decrypt(ciphertext, expected_len, (unsigned char*)seq, 4,
+                        tag, key, iv, data) < 0) {
+        fprintf(stderr, "Decryption failed!\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    (*seq)++;
+}
+//Just one function to send and one function to recieve
 EVP_PKEY* generate_x25519_key(void)
 {
     EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
@@ -286,7 +335,77 @@ int main(void)
     // =============================
 
     
+
+    // --- Client ephemeral X25519 public key ---
+    unsigned char my_pub[PUBKEY_LEN];
+    size_t pub_len = PUBKEY_LEN;
+    EVP_PKEY_get_raw_public_key(my_x25519, my_pub, &pub_len);
+
+    // --- Client signing public key ---
+    unsigned char my_sign_pub[ED25519_PUBKEY_LEN];
+    size_t spub_len = ED25519_PUBKEY_LEN;
+    EVP_PKEY_get_raw_public_key(my_sign_key, my_sign_pub, &spub_len);
+
+    // --- Send client ephemeral + signing keys ---
+    send(sock, my_pub, PUBKEY_LEN, 0);
+    send(sock, my_sign_pub, ED25519_PUBKEY_LEN, 0);
+
+    // --- Sign client ephemeral key ---
+    unsigned char signature[SIG_LEN];
+    size_t sig_len = SIG_LEN;
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx) handle_errors();
+    
+    if (EVP_DigestSignInit(mdctx, NULL, NULL, NULL, my_sign_key) <= 0)
+        handle_errors();
+    if (EVP_DigestSign(mdctx, signature, &sig_len, my_pub, PUBKEY_LEN) <= 0)
+        handle_errors();
+    EVP_MD_CTX_free(mdctx);
+
+    send(sock, signature, SIG_LEN, 0);
+
+    // --- Receive server ephemeral, signing keys and signature ---
+    unsigned char server_pub[PUBKEY_LEN];
+    unsigned char server_sign_pub[ED25519_PUBKEY_LEN];
+    unsigned char server_sig[SIG_LEN];
+
+    recv(sock, server_pub, PUBKEY_LEN, 0);
+    recv(sock, server_sign_pub, ED25519_PUBKEY_LEN, 0);
+    recv(sock, server_sig, SIG_LEN, 0);
+
+    // --- Build server Ed25519 public key for signature verification ---
+    EVP_PKEY *server_sign_key = 
+        EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, server_sign_pub, ED25519_PUBKEY_LEN);
+    if (!server_sign_key) handle_errors();
+
+    // --- Verify server signature ---
+    mdctx = EVP_MD_CTX_new();
+    if (!mdctx) handle_errors();
+    
+    if (EVP_DigestVerifyInit(mdctx, NULL, NULL, NULL, server_sign_key) <= 0)
+        handle_errors();
+    if (EVP_DigestVerify(mdctx, server_sig, SIG_LEN, server_pub, PUBKEY_LEN) <= 0) {
+        fprintf(stderr, "Server authentication failed!\n");
+        exit(EXIT_FAILURE);
+    }
+    EVP_MD_CTX_free(mdctx);
+
+    // --- Build server X25519 public key ---
+    EVP_PKEY *server_x25519 =
+        EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, server_pub, PUBKEY_LEN);
+    if (!server_x25519) handle_errors();
+
     // --- Derive shared secret ---
+    unsigned char shared_secret[SHARED_SECRET_LEN];
+    size_t ss_len = SHARED_SECRET_LEN;
+    derive_shared_secret(my_x25519, server_x25519, shared_secret, &ss_len);
+
+    // --- Derive AES key for secure chat ---
+    unsigned char aes_key[AES_KEY_LEN];
+    derive_aes_key(shared_secret, ss_len, aes_key);
+
+    printf("[Handshake] Finished: AES key established\n");
+   
 
     printf("Handshake verified\n");
 
