@@ -15,7 +15,7 @@
 #include <openssl/err.h>
 #include <openssl/kdf.h>
 #include <openssl/rand.h>
-
+#include <openssl/hmac.h>
 
 #define PORT 4444
 #define PUBKEY_LEN 32
@@ -475,7 +475,7 @@ int main(void)
         printf("Version mismatch\n");
         exit(EXIT_FAILURE);
     }
-    
+
     // --- Load ONLY private signing key ---
     EVP_PKEY *my_sign_key = load_private_key("ed25519_key_A.pem");
     if (!my_sign_key) {
@@ -568,7 +568,6 @@ int main(void)
     derive_shared_secret(my_x25519, server_x25519, shared_secret, &ss_len);
 
     // --- Derive AES key for secure chat ---
-    unsigned char aes_key[AES_KEY_LEN];
     unsigned char client_key[32];
     unsigned char client_iv[12];
     unsigned char client_finished_key[32];
@@ -608,7 +607,7 @@ int main(void)
     // SECURE CHAT
     // =============================
 
-    uint32_t client_seq = 0;
+    uint64_t client_seq = 0;
 
     while (1)
     {
@@ -629,6 +628,7 @@ int main(void)
                     (unsigned char*)buffer,
                     len,
                     client_key,
+                    client_iv,
                     &client_seq);
     }
 
