@@ -262,50 +262,116 @@ typedef struct {
     uint16_t version;        // e.g., 0x0304 for TLS 1.3
     uint16_t cipher_suite;   // e.g., 0x1301 for AES_256_GCM_SHA384
 } handshake_hello_t;
-
-// 2. SECURE SEND FUNCTION
-void secure_send(int sock, const unsigned char *data, size_t len, 
-                 const unsigned char *key, uint32_t *seq) {
-    unsigned char iv[AES_IV_LEN];
-    unsigned char ciphertext[MAX_PAYLOAD];
-    unsigned char tag[AES_TAG_LEN];
-    
-    // Generate random IV
-    make_nonce(iv, client_iv, *seq);
-    
-    // Encrypt with sequence number as AAD
-    int cipher_len = aes_gcm_encrypt(data, len, (unsigned char*)seq, 4, 
-                                     key, iv, ciphertext, tag);
-    
-    // Send: IV + ciphertext + tag
-    send(sock, iv, AES_IV_LEN, 0);
-    send(sock, ciphertext, cipher_len, 0);
-    send(sock, tag, AES_TAG_LEN, 0);
-    
-    (*seq)++;
-}
-
-// 3. SECURE RECEIVE FUNCTION  
-void secure_receive(int sock, unsigned char *data, size_t expected_len,
-                    const unsigned char *key, uint32_t *seq) {
-    unsigned char iv[AES_IV_LEN];
-    unsigned char ciphertext[MAX_PAYLOAD];
-    unsigned char tag[AES_TAG_LEN];
-    
-    make_nonce(iv, server_iv, *seq);
-
-    recv(sock, iv, AES_IV_LEN, 0);
-    recv(sock, ciphertext, expected_len, 0);  
-    recv(sock, tag, AES_TAG_LEN, 0);
-    
-    if (aes_gcm_decrypt(ciphertext, expected_len, (unsigned char*)seq, 4,
-                        tag, key, iv, data) < 0) {
-        fprintf(stderr, "Decryption failed!\n");
+// ── SECURE SEND ─────────────────────────────────────────────────
+// Wire format: [ ciphertext (plaintext_len bytes) | tag (16 bytes) ]
+// IV is derived deterministically: make_nonce(static_iv, seq)
+// AAD: seq in network byte order (4 bytes) — authenticated, not sent
+//
+void secure_send(int sock,
+                 const unsigned char *data,
+                 size_t len,
+                 const unsigned char *key,
+                 const unsigned char *static_iv,   // client_iv or server_iv
+                 uint64_t *seq)
+{
+    if (len > MAX_PAYLOAD) {
+        fprintf(stderr, "[secure_send] payload too large\n");
         exit(EXIT_FAILURE);
     }
-    
+
+    // 1. Build deterministic nonce from static IV XOR'd with seq
+    unsigned char nonce[AES_IV_LEN];
+    make_nonce(nonce, static_iv, *seq);
+
+    // 2. AAD = seq in network byte order so both sides agree
+    uint64_t seq_be = htobe64(*seq);
+
+    // 3. Encrypt
+    unsigned char ciphertext[MAX_PAYLOAD];
+    unsigned char tag[AES_TAG_LEN];
+
+    int cipher_len = aes_gcm_encrypt(
+        data, (int)len,
+        (unsigned char*)&seq_be, sizeof(seq_be),  // AAD
+        key,
+        nonce,
+        ciphertext,
+        tag);
+
+    if (cipher_len < 0) {
+        fprintf(stderr, "[secure_send] encryption failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // 4. Wire: length(4) | ciphertext | tag
+    //    Receiver needs the length because ciphertext_len == plaintext_len
+    //    for AES-GCM but the receiver doesn't know plaintext_len in advance
+    uint32_t len_net = htonl((uint32_t)cipher_len);
+    if (send(sock, &len_net,   4,          0) != 4)          goto send_err;
+    if (send(sock, ciphertext, cipher_len, 0) != cipher_len) goto send_err;
+    if (send(sock, tag,        AES_TAG_LEN, 0) != AES_TAG_LEN) goto send_err;
+
     (*seq)++;
+    return;
+
+send_err:
+    fprintf(stderr, "[secure_send] send() failed\n");
+    exit(EXIT_FAILURE);
 }
+
+// ── SECURE RECEIVE ───────────────────────────────────────────────
+// Returns number of plaintext bytes written into data_out, or -1 on error.
+// data_out must be at least MAX_PAYLOAD bytes.
+//
+int secure_receive(int sock,
+                   unsigned char *data_out,
+                   const unsigned char *key,
+                   const unsigned char *static_iv,  // client_iv or server_iv
+                   uint64_t *seq)
+{
+    // 1. Read length prefix
+    uint32_t len_net;
+    if (recv(sock, &len_net, 4, MSG_WAITALL) != 4) return -1;
+    uint32_t cipher_len = ntohl(len_net);
+
+    if (cipher_len == 0 || cipher_len > MAX_PAYLOAD) {
+        fprintf(stderr, "[secure_receive] bad length %u\n", cipher_len);
+        return -1;
+    }
+
+    // 2. Read ciphertext + tag
+    unsigned char ciphertext[MAX_PAYLOAD];
+    unsigned char tag[AES_TAG_LEN];
+
+    if (recv(sock, ciphertext, cipher_len, MSG_WAITALL) != (ssize_t)cipher_len) return -1;
+    if (recv(sock, tag,        AES_TAG_LEN, MSG_WAITALL) != AES_TAG_LEN)        return -1;
+
+    // 3. Reconstruct the same nonce the sender used
+    unsigned char nonce[AES_IV_LEN];
+    make_nonce(nonce, static_iv, *seq);
+
+    // 4. Reconstruct the same AAD the sender used
+    uint64_t seq_be = htobe64(*seq);
+
+    // 5. Decrypt + verify GCM tag
+    int plaintext_len = aes_gcm_decrypt(
+        ciphertext, (int)cipher_len,
+        (unsigned char*)&seq_be, sizeof(seq_be),  // AAD
+        tag,
+        key,
+        nonce,
+        data_out);
+
+    if (plaintext_len < 0) {
+        fprintf(stderr, "[secure_receive] GCM authentication FAILED (seq=%llu)\n",
+                (unsigned long long)*seq);
+        return -1;
+    }
+
+    (*seq)++;
+    return plaintext_len;
+}
+
 //Just one function to send and one function to recieve
 void hkdf_expand(const unsigned char *secret,
                  size_t secret_len,
