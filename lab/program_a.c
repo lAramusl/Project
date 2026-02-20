@@ -359,6 +359,18 @@ void transcript_final(unsigned char *out)
     EVP_DigestFinal_ex(transcript_ctx, out, NULL);
 }
 
+int recv_all(int sock, unsigned char *buf, size_t len)
+{
+    size_t total = 0;
+    while (total < len) {
+        ssize_t r = recv(sock, buf + total, len - total, 0);
+        if (r <= 0) return -1;
+        total += r;
+    }
+    return 0;
+}
+
+
 int main(void)
 {
     ERR_load_crypto_strings();
@@ -397,6 +409,7 @@ int main(void)
         printf("Version mismatch\n");
         exit(EXIT_FAILURE);
     }
+    
     // --- Load ONLY private signing key ---
     EVP_PKEY *my_sign_key = load_private_key("ed25519_key_A.pem");
     if (!my_sign_key) {
@@ -411,7 +424,6 @@ int main(void)
     // HANDSHAKE
     // =============================
 
-    
 
     // --- Client ephemeral X25519 public key ---
     unsigned char my_pub[PUBKEY_LEN];
@@ -492,18 +504,18 @@ int main(void)
     // --- Derive AES key for secure chat ---
     unsigned char aes_key[AES_KEY_LEN];
     unsigned char client_key[32];
-    unsigned char server_key[32];
     unsigned char client_iv[12];
-    unsigned char server_iv[12];
     unsigned char client_finished_key[32];
-    unsigned char server_finished_key[32];
+    //unsigned char server_key[32];
+    //unsigned char server_iv[12];
+    //unsigned char server_finished_key[32];
 
     hkdf_expand(shared_secret, ss_len, "client key", client_key, 32);
-    hkdf_expand(shared_secret, ss_len, "server key", server_key, 32);
     hkdf_expand(shared_secret, ss_len, "client iv", client_iv, 12);
-    hkdf_expand(shared_secret, ss_len, "server iv", server_iv, 12);
     hkdf_expand(shared_secret, ss_len, "client finished", client_finished_key, 32);
-    hkdf_expand(shared_secret, ss_len, "server finished", server_finished_key, 32);
+    //hkdf_expand(shared_secret, ss_len, "server key", server_key, 32);
+    //hkdf_expand(shared_secret, ss_len, "server iv", server_iv, 12);
+    //hkdf_expand(shared_secret, ss_len, "server finished", server_finished_key, 32);
 
     unsigned char transcript_hash[32];
     transcript_final(transcript_hash);
@@ -513,29 +525,45 @@ int main(void)
 
     send(sock, my_finished, 32, 0);
 
-    unsigned char server_finished[32];
-    recv(sock, server_finished, 32, 0);
+    // unsigned char server_finished[32];
+    // recv(sock, server_finished, 32, 0);
 
-    unsigned char expected[32];
-    compute_finished(server_finished_key, transcript_hash, expected);
+    // unsigned char expected[32];
+    // compute_finished(server_finished_key, transcript_hash, expected);
 
-    if (memcmp(expected, server_finished, 32) != 0) {
-        printf("Finished verify failed\n");
-        exit(EXIT_FAILURE);
-    }
+    // if (memcmp(expected, server_finished, 32) != 0) {
+    //     printf("Finished verify failed\n");
+    //     exit(EXIT_FAILURE);
+    // }
 
     printf("[Handshake] Finished: AES key established\n");
-   
-
-    printf("Handshake verified\n");
 
     // =============================
     // SECURE CHAT
     // =============================
 
+    uint32_t client_seq = 0;
+
     while (1)
     {
+        char buffer[1024];
 
+        printf("You: ");
+        fflush(stdout);
+
+        if (!fgets(buffer, sizeof(buffer), stdin))
+            break;
+
+        size_t len = strlen(buffer);
+
+        uint32_t net_len = htonl(len);
+        send(sock, &net_len, sizeof(net_len), 0);
+
+        secure_send(sock,
+                    (unsigned char*)buffer,
+                    len,
+                    client_key,
+                    &client_seq);
     }
 
     close(sock);
