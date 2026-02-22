@@ -51,6 +51,19 @@ EVP_PKEY* load_private_key(const char *filename)
     return pkey;
 }
 
+EVP_PKEY* load_public_key(const char* filename)
+{
+    FILE* f = fopen(filename, "r");
+    if (!f) abort();
+
+    EVP_PKEY* key = PEM_read_PUBKEY(f, NULL, NULL, NULL);
+    fclose(f);
+
+    if (!key) abort();
+
+    return key;
+}
+
 void make_nonce(unsigned char *nonce,
                 const unsigned char *static_iv,
                 uint64_t seq)
@@ -101,42 +114,6 @@ void derive_shared_secret(EVP_PKEY *privkey,
 // ===== HKDF + AES-256-GCM =====
 
 // ================= HKDF =================
-
-void derive_aes_key(const unsigned char *shared_secret,
-                    size_t shared_secret_len,
-                    unsigned char *aes_key)
-{
-    EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
-    if (!kctx) handle_errors();
-
-    if (EVP_PKEY_derive_init(kctx) <= 0)
-        handle_errors();
-
-    if (EVP_PKEY_CTX_set_hkdf_md(kctx, EVP_sha256()) <= 0)
-        handle_errors();
-
-    if (EVP_PKEY_CTX_set1_hkdf_salt(kctx,
-                                    (unsigned char*)"salt",
-                                    4) <= 0)
-        handle_errors();
-
-    if (EVP_PKEY_CTX_set1_hkdf_key(kctx,
-                                   shared_secret,
-                                   shared_secret_len) <= 0)
-        handle_errors();
-
-    if (EVP_PKEY_CTX_add1_hkdf_info(kctx,
-                                    (unsigned char*)"handshake data",
-                                    14) <= 0)
-        handle_errors();
-
-    size_t key_len = AES_KEY_LEN;
-
-    if (EVP_PKEY_derive(kctx, aes_key, &key_len) <= 0)
-        handle_errors();
-
-    EVP_PKEY_CTX_free(kctx);
-}
 
 // ================= AES-GCM ENCRYPT =================
 
@@ -375,18 +352,25 @@ int secure_receive(int sock,
 //Just one function to send and one function to recieve
 void hkdf_expand(const unsigned char *secret,
                  size_t secret_len,
+                 const unsigned char *salt,
+                 size_t salt_len,
                  const char *label,
                  unsigned char *out,
                  size_t out_len)
 {
     EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
-    EVP_PKEY_derive_init(kctx);
-    EVP_PKEY_CTX_set_hkdf_md(kctx, EVP_sha256());
-    EVP_PKEY_CTX_set1_hkdf_key(kctx, secret, secret_len);
-    EVP_PKEY_CTX_add1_hkdf_info(kctx,
-                                (unsigned char*)label,
-                                strlen(label));
-    EVP_PKEY_derive(kctx, out, &out_len);
+    if (!kctx) handle_errors();
+
+    if (EVP_PKEY_derive_init(kctx) <= 0) handle_errors();
+    if (EVP_PKEY_CTX_set_hkdf_md(kctx, EVP_sha256()) <= 0) handle_errors();
+    if (EVP_PKEY_CTX_set1_hkdf_salt(kctx, salt, salt_len) <= 0) handle_errors();
+    if (EVP_PKEY_CTX_set1_hkdf_key(kctx, secret, secret_len) <= 0) handle_errors();
+    if (EVP_PKEY_CTX_add1_hkdf_info(kctx,
+                                   (unsigned char*)label,
+                                   strlen(label)) <= 0) handle_errors();
+
+    if (EVP_PKEY_derive(kctx, out, &out_len) <= 0) handle_errors();
+
     EVP_PKEY_CTX_free(kctx);
 }
 
@@ -503,59 +487,59 @@ int main(void)
 
     // --- Send client ephemeral + signing keys ---
     send(sock, my_pub, PUBKEY_LEN, 0);
-    send(sock, my_sign_pub, ED25519_PUBKEY_LEN, 0);
 
     // --- Sign client ephemeral key ---
     unsigned char signature[SIG_LEN];
     size_t sig_len = SIG_LEN;
-    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-    if (!mdctx) handle_errors();
+    EVP_MD_CTX *sign_ctx = EVP_MD_CTX_new();
+    if (!sign_ctx) handle_errors();
     
-    if (EVP_DigestSignInit(mdctx, NULL, NULL, NULL, my_sign_key) <= 0)
-        handle_errors();
-    unsigned char temp_hash[32];
-    EVP_MD_CTX *tmp = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(tmp, EVP_sha256(), NULL);
-    EVP_DigestUpdate(tmp, my_pub, PUBKEY_LEN);
-    EVP_DigestFinal_ex(tmp, temp_hash, NULL);
-    EVP_MD_CTX_free(tmp);
+    if (EVP_DigestSignInit(sign_ctx, NULL, NULL, NULL, my_sign_key) <= 0)
+    handle_errors();
 
-    EVP_DigestSign(mdctx, signature, &sig_len, temp_hash, 32);
+    if (EVP_DigestSign(sign_ctx, signature, &sig_len, my_pub, PUBKEY_LEN) <= 0)
+        handle_errors();
+
+    EVP_MD_CTX_free(sign_ctx);
+
     transcript_update(my_pub, PUBKEY_LEN);
-    transcript_update(my_sign_pub, ED25519_PUBKEY_LEN);
     transcript_update(signature, SIG_LEN);
+
 
     send(sock, signature, SIG_LEN, 0);
 
     // --- Receive server ephemeral, signing keys and signature ---
+
+    EVP_PKEY *server_sign_pub = load_public_key("ed25519_key_B_pub.pem");
+    if (!server_sign_pub) {
+        fprintf(stderr, "Server Signing key missing\n");
+        exit(EXIT_FAILURE);
+    }
+
     unsigned char server_pub[PUBKEY_LEN];
-    unsigned char server_sign_pub[ED25519_PUBKEY_LEN];
-    unsigned char server_sig[SIG_LEN];
-
-    recv(sock, server_pub, PUBKEY_LEN, 0);
-    recv(sock, server_sign_pub, ED25519_PUBKEY_LEN, 0);
-    recv(sock, server_sig, SIG_LEN, 0);
-
+    recv_all(sock, server_pub, PUBKEY_LEN);
     transcript_update(server_pub, PUBKEY_LEN);
-    transcript_update(server_sign_pub, ED25519_PUBKEY_LEN);
+
+    unsigned char server_sig[SIG_LEN];
+    recv_all(sock, server_sig, SIG_LEN);
     transcript_update(server_sig, SIG_LEN);
 
-    // --- Build server Ed25519 public key for signature verification ---
-    EVP_PKEY *server_sign_key = 
-        EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, server_sign_pub, ED25519_PUBKEY_LEN);
-    if (!server_sign_key) handle_errors();
-
     // --- Verify server signature ---
-    mdctx = EVP_MD_CTX_new();
-    if (!mdctx) handle_errors();
-    
-    if (EVP_DigestVerifyInit(mdctx, NULL, NULL, NULL, server_sign_key) <= 0)
+    EVP_MD_CTX *verify_ctx = EVP_MD_CTX_new();
+    if (!verify_ctx) handle_errors();
+
+    if (EVP_DigestVerifyInit(verify_ctx, NULL, NULL, NULL, server_sign_pub) <= 0)
         handle_errors();
-    if (EVP_DigestVerify(mdctx, server_sig, SIG_LEN, server_pub, PUBKEY_LEN) <= 0) {
+
+    if (EVP_DigestVerify(verify_ctx,
+                         server_sig, SIG_LEN,
+                         server_pub, PUBKEY_LEN) <= 0)
+    {
         fprintf(stderr, "Server authentication failed!\n");
         exit(EXIT_FAILURE);
     }
-    EVP_MD_CTX_free(mdctx);
+
+    EVP_MD_CTX_free(verify_ctx);
 
     // --- Build server X25519 public key ---
     EVP_PKEY *server_x25519 =
@@ -571,41 +555,55 @@ int main(void)
     unsigned char client_key[32];
     unsigned char client_iv[12];
     unsigned char client_finished_key[32];
-    //unsigned char server_key[32];
-    //unsigned char server_iv[12];
-    //unsigned char server_finished_key[32];
-
-    hkdf_expand(shared_secret, ss_len, "client key", client_key, 32);
-    hkdf_expand(shared_secret, ss_len, "client iv", client_iv, 12);
-    hkdf_expand(shared_secret, ss_len, "client finished", client_finished_key, 32);
-    //hkdf_expand(shared_secret, ss_len, "server key", server_key, 32);
-    //hkdf_expand(shared_secret, ss_len, "server iv", server_iv, 12);
-    //hkdf_expand(shared_secret, ss_len, "server finished", server_finished_key, 32);
 
     unsigned char transcript_hash[32];
     transcript_final(transcript_hash);
+
+    hkdf_expand(shared_secret, ss_len,
+                transcript_hash, 32,
+                "client key",
+                client_key, 32);
+
+    hkdf_expand(shared_secret, ss_len,
+                transcript_hash, 32,
+                "client iv",
+                client_iv, 12);
+
+    hkdf_expand(shared_secret, ss_len,
+                transcript_hash, 32,
+                "client finished",
+                client_finished_key, 32);
 
     unsigned char my_finished[32];
     compute_finished(client_finished_key, transcript_hash, my_finished);
 
     send(sock, my_finished, 32, 0);
 
-    // unsigned char server_finished[32];
-    // recv(sock, server_finished, 32, 0);
+    unsigned char server_finished[32];
+    recv(sock, server_finished, 32, 0);
 
-    // unsigned char expected[32];
-    // compute_finished(server_finished_key, transcript_hash, expected);
+    unsigned char server_finished_key[32];
 
-    // if (memcmp(expected, server_finished, 32) != 0) {
-    //     printf("Finished verify failed\n");
-    //     exit(EXIT_FAILURE);
-    // }
+    hkdf_expand(shared_secret, ss_len,
+                transcript_hash, 32,
+                "server finished",
+                server_finished_key, 32);
+
+    unsigned char expected[32];
+    compute_finished(server_finished_key, transcript_hash, expected);
+
+    if (memcmp(expected, server_finished, 32) != 0) {
+        printf("Finished verify failed\n");
+        exit(EXIT_FAILURE);
+    }
 
     printf("[Handshake] Finished: AES key established\n");
 
     // =============================
     // SECURE CHAT
     // =============================
+
+    OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
 
     uint64_t client_seq = 0;
 
@@ -620,9 +618,6 @@ int main(void)
             break;
 
         size_t len = strlen(buffer);
-
-        uint32_t net_len = htonl(len);
-        send(sock, &net_len, sizeof(net_len), 0);
 
         secure_send(sock,
                     (unsigned char*)buffer,
