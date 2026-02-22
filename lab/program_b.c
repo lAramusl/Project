@@ -349,11 +349,11 @@ int main(void)
     transcript_final(transcript_hash);
 
     /* 10. Derive keys */
-    unsigned char server_key[32],          server_iv[12];
+    unsigned char client_key[32],          client_iv[12];
     unsigned char server_finished_key[32], client_finished_key[32];
 
-    hkdf_expand(shared_secret, ss_len, transcript_hash, 32, "server key",      server_key,          32);
-    hkdf_expand(shared_secret, ss_len, transcript_hash, 32, "server iv",       server_iv,           12);
+    hkdf_expand(shared_secret, ss_len, transcript_hash, 32, "client key",      client_key,          32);
+    hkdf_expand(shared_secret, ss_len, transcript_hash, 32, "client iv",       client_iv,           12);
     hkdf_expand(shared_secret, ss_len, transcript_hash, 32, "server finished", server_finished_key, 32);
     hkdf_expand(shared_secret, ss_len, transcript_hash, 32, "client finished", client_finished_key, 32);
 
@@ -386,7 +386,7 @@ int main(void)
     while (1) {
         unsigned char buffer[MAX_PAYLOAD + 1];
 
-        int n = secure_receive(sock, buffer, server_key, server_iv, &server_seq);
+        int n = secure_receive(sock, buffer, client_key, client_iv, &server_seq);
         if (n <= 0) {
             printf("[Server] Client disconnected\n");
             break;
