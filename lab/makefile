@@ -1,29 +1,24 @@
-CC = gcc
-CFLAGS = -Wall -fPIC # Add other CFLAGS you need
-LDFLAGS = 
-LIBS = 
+CC     = gcc
+CFLAGS = -Wall -Wextra $(shell pkg-config --cflags openssl)
+LIBS   = $(shell pkg-config --libs openssl)
 
-CFLAGS += $(shell pkg-config --cflags openssl)
-LIBS += $(shell pkg-config --libs openssl)
+all: keygen server client
 
-# Alternative for specific libraries if 'openssl' meta-package is not available:
-# LIBS += $(shell pkg-config --libs libcrypto libssl)
-# Example target
-all: keygen program_a program_b
+keygen: keygen.c
+	$(CC) $(CFLAGS) $< -o $@ $(LIBS)
 
-keygen: keygen.o
-	$(CC) -o $@ $^ $(LDFLAGS) $(LIBS)
+server: program_b.c
+	$(CC) $(CFLAGS) $< -o $@ $(LIBS)
 
-keygen.o: keygen.c
-	$(CC) -c $(CFLAGS) $< -o $@
+client: program_a.c
+	$(CC) $(CFLAGS) $< -o $@ $(LIBS)
 
-program_a: program_a.c
-	$(CC) $^ -o client $(CFLAGS) $(LIBS)
-
-program_b: program_b.c
-	$(CC) $^ -o server $(CFLAGS) $(LIBS)
+keys: keygen
+	./keygen
 
 clean:
-	rm -f *.o
-	rm -f program_a program_b keygen
+	rm -f keygen server client *.o
+	rm -f ed25519_key_A.pem ed25519_key_A_pub.pem \
+	      ed25519_key_B.pem ed25519_key_B_pub.pem
 
+.PHONY: all keys clean
