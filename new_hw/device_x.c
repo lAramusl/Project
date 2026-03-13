@@ -16,6 +16,7 @@
 #include <linux/if.h>
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
+#include <arpa/inet.h>
 
 #define IFACE        "veth_x"
 #define MY_ETHERTYPE 0x9999
